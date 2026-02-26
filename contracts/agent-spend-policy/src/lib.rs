@@ -242,18 +242,18 @@ impl SmartAccountPolicy for AgentSpendPolicy {
             return false;
         }
 
-        // Extract token + amount from transfer context
-        let (token, amount) = extract_transfer(env, &contexts);
-        if amount == 0 {
-            // Non-transfer operation → allow (swap auth, approve, etc.)
+        // Sum USDC value of ALL transfers in contexts.
+        // V4 router batches [transfer + fee_transfer] in one auth entry —
+        // we must count every transfer, not just the first.
+        let usdc_value = sum_transfer_usdc_value(env, &contexts);
+
+        // No transfers found → non-transfer op (approve, swap, etc.) → allow
+        if usdc_value == 0 {
             return true;
         }
 
-        // Convert to USDC equivalent
-        let usdc_value = to_usdc_value(env, &token, amount);
-
-        // Can't price it → reject (unknown value = unsafe)
-        if usdc_value <= 0 {
+        // Negative means an unknown token was encountered → reject
+        if usdc_value < 0 {
             return false;
         }
 
@@ -293,24 +293,37 @@ fn current_day(env: &Env) -> u64 {
     u64::from(env.ledger().sequence()) / LEDGERS_PER_DAY
 }
 
-/// Extract (token_contract_address, amount) from transfer contexts.
+/// Sum USDC-equivalent value of ALL `transfer` calls in the auth contexts.
 ///
-/// SAC `transfer(from, to, amount)` — the `contract` field in ContractContext
-/// is the token contract itself.
-fn extract_transfer(env: &Env, contexts: &Vec<Context>) -> (Address, i128) {
+/// The V4 router batches multiple operations (e.g. transfer + fee_transfer)
+/// into a single auth entry. We must count EVERY transfer, not just the first.
+///
+/// Returns:
+///   > 0  — total USDC value of all transfers
+///   = 0  — no transfers found (non-transfer operation)
+///   < 0  — at least one transfer has an unknown/un-priceable token (reject)
+fn sum_transfer_usdc_value(env: &Env, contexts: &Vec<Context>) -> i128 {
+    let transfer_sym = Symbol::new(env, "transfer");
+    let mut total: i128 = 0;
+
     for ctx in contexts.iter() {
         if let Context::Contract(c) = ctx {
-            let fn_name = Symbol::new(env, "transfer");
-            if c.fn_name == fn_name && c.args.len() >= 3 {
+            if c.fn_name == transfer_sym && c.args.len() >= 3 {
                 if let Ok(amount) = i128::try_from_val(env, &c.args.get_unchecked(2)) {
-                    // c.contract = the token being transferred
-                    return (c.contract.clone(), amount);
+                    if amount == 0 {
+                        continue;
+                    }
+                    let value = to_usdc_value(env, &c.contract, amount);
+                    if value <= 0 {
+                        // Unknown token → entire batch is rejected
+                        return -1;
+                    }
+                    total += value;
                 }
             }
         }
     }
-    // No transfer found — return dummy with 0 amount
-    (env.current_contract_address(), 0)
+    total
 }
 
 /// Convert a token amount to USDC-equivalent stroops.
@@ -876,5 +889,169 @@ mod test {
             args: (Address::generate(&env), 1_000_000_000i128).into_val(&env),
         });
         assert!(!client.is_authorized(&signer, &make_contexts(&env, ctx)));
+    }
+
+    // ── V4 Router multi-transfer tests ──
+    //
+    // The V4 router batches [transfer + fee_transfer] in a single auth entry.
+    // The policy must count BOTH toward the daily limit.
+
+    /// Helper: build contexts with multiple transfers (simulates V4 router exec)
+    fn make_router_contexts(
+        env: &Env,
+        router: &Address,
+        transfers: &[(Address, i128)], // (token, amount) pairs
+    ) -> Vec<Context> {
+        let mut v = Vec::new(env);
+
+        // Root: router.exec(...) — NOT a transfer
+        v.push_back(Context::Contract(ContractContext {
+            contract: router.clone(),
+            fn_name: Symbol::new(env, "exec"),
+            args: (Address::generate(env),).into_val(env),
+        }));
+
+        // Sub-invocations: one transfer per operation
+        for (token, amount) in transfers {
+            v.push_back(Context::Contract(ContractContext {
+                contract: token.clone(),
+                fn_name: Symbol::new(env, "transfer"),
+                args: (
+                    Address::generate(env), // from
+                    Address::generate(env), // to
+                    *amount,
+                )
+                    .into_val(env),
+            }));
+        }
+        v
+    }
+
+    #[test]
+    fn test_v4_router_transfer_plus_fee_both_counted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_usdc, client, _admin) = setup_policy(&env, 500_0000000);
+
+        let xlm = Address::generate(&env);
+        let router = Address::generate(&env);
+
+        // XLM at $0.15
+        client.set_price(&xlm, &1_500_000);
+
+        let wallet = Address::generate(&env);
+
+        // V4 router: transfer 100 XLM ($15) + fee 0.3 XLM ($0.045)
+        let contexts = make_router_contexts(&env, &router, &[
+            (xlm.clone(), 100_0000000),   // main transfer
+            (xlm.clone(), 3000000),        // 0.3 XLM fee
+        ]);
+
+        assert!(client.is_authorized(&wallet, &contexts));
+
+        // Both transfers counted: $15.00 + $0.045 = $15.045
+        // 15_0000000 + 450000 = 150_450000
+        assert_eq!(client.spent_today(&wallet), 150_450000);
+    }
+
+    #[test]
+    fn test_v4_router_multi_transfer_hits_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_usdc, client, _admin) = setup_policy(&env, 100_0000000); // $100 limit
+
+        let xlm = Address::generate(&env);
+        let router = Address::generate(&env);
+
+        // XLM at $0.15
+        client.set_price(&xlm, &1_500_000);
+
+        let wallet = Address::generate(&env);
+
+        // Attacker tries to split: 500 XLM ($75) + 500 XLM ($75) = $150 > $100
+        // Without fix, only first $75 counted → would pass incorrectly
+        let contexts = make_router_contexts(&env, &router, &[
+            (xlm.clone(), 500_0000000),
+            (xlm.clone(), 500_0000000),
+        ]);
+
+        // Must reject — total is $150, limit is $100
+        assert!(!client.is_authorized(&wallet, &contexts));
+        assert_eq!(client.spent_today(&wallet), 0); // nothing recorded
+    }
+
+    #[test]
+    fn test_v4_router_mixed_tokens_summed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (usdc, client, _admin) = setup_policy(&env, 500_0000000);
+
+        let xlm = Address::generate(&env);
+        let router = Address::generate(&env);
+
+        // XLM at $0.15
+        client.set_price(&xlm, &1_500_000);
+
+        let wallet = Address::generate(&env);
+
+        // Transfer 100 XLM ($15) + fee 2 USDC ($2) = $17 total
+        let contexts = make_router_contexts(&env, &router, &[
+            (xlm.clone(), 100_0000000),   // 100 XLM = $15
+            (usdc.clone(), 2_0000000),     // 2 USDC = $2
+        ]);
+
+        assert!(client.is_authorized(&wallet, &contexts));
+        assert_eq!(client.spent_today(&wallet), 17_0000000); // $15 + $2
+    }
+
+    #[test]
+    fn test_v4_router_unknown_token_in_batch_rejects_all() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_usdc, client, _admin) = setup_policy(&env, 500_0000000);
+
+        let xlm = Address::generate(&env);
+        let unknown = Address::generate(&env);
+        let router = Address::generate(&env);
+
+        client.set_price(&xlm, &1_500_000);
+        // unknown token has NO price set
+
+        let wallet = Address::generate(&env);
+
+        // Transfer 10 XLM ($1.50) + 10 unknown_token (no price) → reject entire batch
+        let contexts = make_router_contexts(&env, &router, &[
+            (xlm.clone(), 10_0000000),
+            (unknown.clone(), 10_0000000),
+        ]);
+
+        assert!(!client.is_authorized(&wallet, &contexts));
+        assert_eq!(client.spent_today(&wallet), 0); // nothing recorded
+    }
+
+    #[test]
+    fn test_router_exec_without_transfers_allowed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_usdc, client, _admin) = setup_policy(&env, 500_0000000);
+
+        let router = Address::generate(&env);
+        let wallet = Address::generate(&env);
+
+        // Router exec with only non-transfer ops (e.g. approve, swap)
+        let mut v = Vec::new(&env);
+        v.push_back(Context::Contract(ContractContext {
+            contract: router.clone(),
+            fn_name: Symbol::new(&env, "exec"),
+            args: (Address::generate(&env),).into_val(&env),
+        }));
+        v.push_back(Context::Contract(ContractContext {
+            contract: Address::generate(&env),
+            fn_name: Symbol::new(&env, "approve"),
+            args: (Address::generate(&env), 1_000_000_000i128).into_val(&env),
+        }));
+
+        assert!(client.is_authorized(&wallet, &v));
+        assert_eq!(client.spent_today(&wallet), 0); // no spend
     }
 }
