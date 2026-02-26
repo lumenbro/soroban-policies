@@ -1,0 +1,5 @@
+target/
+.soroban/
+*.swp
+*.swo
+.DS_Store

@@ -1,0 +1,17 @@
+[package]
+name = "agent-spend-policy"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/lumenbro/soroban-policies"
+description = "USD-equivalent daily spend limit policy for Stellar smart account agent signers. Converts any Soroban token to USDC value via admin-cached prices or Soroswap router fallback. Includes per-instance kill switch (pause/unpause)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
