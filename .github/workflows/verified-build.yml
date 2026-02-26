@@ -1,0 +1,26 @@
+name: Verified Build
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: 'Release name (e.g. v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: write
+  attestations: write
+
+jobs:
+  release-agent-spend-policy:
+    uses: stellar-expert/soroban-build-workflow/.github/workflows/release.yml@v22.8.1
+    with:
+      release_name: ${{ github.event.inputs.release_name || github.ref_name }}
+      release_description: 'Agent Spend Policy — USD-equivalent daily spend limits for Stellar smart account agent signers'
+      package: 'agent-spend-policy'
+    secrets:
+      release_token: ${{ secrets.GITHUB_TOKEN }}
