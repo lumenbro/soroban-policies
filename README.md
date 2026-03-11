@@ -4,7 +4,7 @@ Soroban smart contract policies for [LumenBro](https://lumenbro.com) smart accou
 
 ## Contracts
 
-### Agent Spend Policy
+### Agent Spend Policy (v1)
 
 USD-equivalent daily spend limit enforced on-chain for agent signers (bot signers, session signers, MCP agents). Each policy instance is initialized with a configurable daily limit and converts token amounts to USDC value via:
 
@@ -12,7 +12,23 @@ USD-equivalent daily spend limit enforced on-chain for agent signers (bot signer
 2. **Admin-cached prices** — fast path (~50K CPU), set via `set_price` / `set_prices`
 3. **Soroswap router fallback** — on-chain DEX quote (~1-2M CPU)
 
-#### Features
+**Gates:** `transfer()` only. Non-transfer operations (`approve`, `swap`, etc.) pass through unchecked.
+
+**Use for:** Retail wallet signers operating within the LumenBro platform (internal codebase controls contract interactions — no approve bypass risk).
+
+### Agent Spend Policy v2
+
+Same daily spend limit engine as v1 with one critical security addition: **gates both `transfer()` AND `approve()` calls** against the daily limit.
+
+**Why v2 exists:** v1 only inspects `transfer()` calls in `is_authorized()`. An agent signer could call `approve(malicious_contract, huge_amount)` on any token, then the malicious contract drains the wallet via `transfer_from()` — completely bypassing the daily spend limit. This is acceptable for retail signers (platform controls all contract interactions) but dangerous for autonomous agent signers operating in the wild.
+
+**v2 fix:** `approve()` amounts are valued in USDC (same 3-tier price resolution) and counted against the daily limit. This prevents drain-via-allowance attacks while still allowing legitimate DEX interactions within the daily budget.
+
+**Use for:** Agent operator portal signers (`agents.lumenbro.com`) — autonomous agents that may interact with arbitrary contracts.
+
+**Drop-in compatible:** Same 15 exported functions, same `initialize()` parameters, same storage model. Only behavioral change: `approve()` is now gated.
+
+#### Features (both v1 and v2)
 
 - **Configurable daily limit** — set at `initialize()`, changeable via `set_limit()`
 - **Kill switch** — `pause()` / `unpause()` instantly blocks all `is_authorized()` calls
@@ -51,7 +67,17 @@ USD-equivalent daily spend limit enforced on-chain for agent signers (bot signer
 |----------|-------------|
 | `on_add(source)` | Called when policy is attached to a signer |
 | `on_revoke(source)` | Called when policy is detached from a signer |
-| `is_authorized(source, contexts)` | Enforces daily spend limit on transfers |
+| `is_authorized(source, contexts)` | Enforces daily spend limit on transfers (v1) or transfers + approvals (v2) |
+
+#### v1 vs v2 Behavior Comparison
+
+| Operation | v1 | v2 |
+|-----------|----|----|
+| `transfer(from, to, amount)` | Gated (counts against limit) | Gated (counts against limit) |
+| `approve(from, spender, amount, expiry)` | **Passthrough (unchecked)** | **Gated (counts against limit)** |
+| `swap(...)`, `exec(...)`, etc. | Passthrough | Passthrough |
+| Paused state | Blocks everything | Blocks everything |
+| Unknown token in batch | Rejects entire batch | Rejects entire batch |
 
 ## Verified Builds
 
@@ -70,32 +96,32 @@ This repository uses [stellar-expert/soroban-build-workflow](https://github.com/
 # Prerequisites: Rust + stellar-cli
 rustup target add wasm32-unknown-unknown
 
-# Build
-cd contracts/agent-spend-policy
+# Build all contracts
+stellar contract build
+
+# Build specific contract
+cd contracts/agent-spend-policy      # v1
+cd contracts/agent-spend-policy-v2   # v2
 make build
 
-# Test (20 tests)
-make test
-
-# Optimize for deployment
-stellar contract optimize \
-  --wasm ../../target/wasm32-unknown-unknown/release/agent_spend_policy.wasm \
-  --wasm-out ../../target/agent_spend_policy.optimized.wasm
+# Test
+cargo test -p agent-spend-policy      # 20 tests (v1)
+cargo test -p agent-spend-policy-v2   # 36 tests (v2)
 ```
 
 ## Deploy
 
 ```bash
 # Upload WASM (once per network)
-stellar contract deploy --wasm target/agent_spend_policy.optimized.wasm \
+stellar contract deploy --wasm target/wasm32v1-none/release/agent_spend_policy_v2.wasm \
   --source <deployer> --network <testnet|mainnet>
 
-# Initialize instance
+# Initialize instance ($500/day limit)
 stellar contract invoke --id <contract-id> --fn initialize -- \
   --admin <admin-address> \
   --usdc <usdc-sac-address> \
   --router <soroswap-router-address> \
-  --daily_limit_usdc 5000000000  # $500 in USDC stroops
+  --daily_limit_usdc 5000000000
 
 # Set token prices
 stellar contract invoke --id <contract-id> --fn set_price -- \

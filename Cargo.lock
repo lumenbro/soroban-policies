@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-spend-policy-v2"
+version = "2.0.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
